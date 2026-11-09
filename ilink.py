@@ -1,8 +1,12 @@
 """Minimal WeChat ClawBot iLink client.
 Protocol notes: https://chihao.li/blog/en/wechat-clawbot-ilink-protocol and the
-@tencent-weixin/openclaw-weixin 2.4.9 npm package (headers / base_info mimic that client)."""
+@tencent-weixin/openclaw-weixin 2.4.9 npm package (headers / base_info mimic that client).
+
+Outbound sends are constrained to the verified bind owner (credentials.json ilink_user_id).
+"""
 import base64, json, os, random, secrets, urllib.request
 from config import DATA_DIR
+from owner import OwnerError, require_owner
 DIR = DATA_DIR
 CRED = os.path.join(DIR, "credentials.json")   # written by bind.py; NEVER commit
 STATE = os.path.join(DIR, "state.json")        # cursor + context tokens + recent raw msgs; NEVER commit
@@ -31,14 +35,27 @@ def post(endpoint, body, timeout=15):
     with urllib.request.urlopen(r, timeout=timeout) as f:
         return f.read().decode()
 
+def resolve_send_target(to=None):
+    """Return the only allowed recipient (bind owner). Raises OwnerError otherwise."""
+    owner = require_owner()
+    if to is None:
+        return owner
+    if (to or "").strip() != owner:
+        raise OwnerError("refusing send to non-owner recipient")
+    return owner
+
 def send_text(text, to=None, context_token=None):
-    """Send one text. to defaults to the last user who wrote, else the binder (ilink_user_id).
-    context_token=None -> use the latest stored token for that user; "" -> send without one."""
-    st = load_state(); c = creds()
-    to = to or st.get("last_from_user_id") or c["ilink_user_id"]
+    """Send one text to the verified bind owner only.
+
+    to must be omitted or equal the bind owner; any other recipient raises OwnerError.
+    context_token=None -> use the latest stored token for the owner; "" -> send without one.
+    Does not fall back to last_from_user_id (that could be poisoned before hardening).
+    """
+    owner = resolve_send_target(to)
+    st = load_state()
     if context_token is None:
-        context_token = st.get("context_tokens", {}).get(to)
-    msg = {"from_user_id": "", "to_user_id": to, "client_id": "openclaw-weixin-" + secrets.token_hex(8),
+        context_token = st.get("context_tokens", {}).get(owner)
+    msg = {"from_user_id": "", "to_user_id": owner, "client_id": "openclaw-weixin-" + secrets.token_hex(8),
            "message_type": 2, "message_state": 2, "item_list": [{"type": 1, "text_item": {"text": text}}]}
     if context_token: msg["context_token"] = context_token
     resp = post("ilink/bot/sendmessage", {"msg": msg})

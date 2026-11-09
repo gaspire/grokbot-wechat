@@ -12,6 +12,13 @@
 > iLink 协议细节参考 [chihao.li 的拆解](https://chihao.li/blog/en/wechat-clawbot-ilink-protocol) 和腾讯的
 > `@tencent-weixin/openclaw-weixin` npm 包。ClawBot 是官方功能（有服务条款），不是 hook / 逆向客户端。
 
+### 安全默认（owner-only）
+- 信任主人身份 **只** 来自官方扫码绑定确认包里的 `ilink_user_id`（`status=confirmed`，且为 `@im.wechat`）；**不会**用 bot id 冒充主人。缺省 / 歧义则 fail closed。
+- 非主人入站在更新 state / history / 时钟 / token / 媒体 / webhook **之前**被丢弃（仍推进 iLink 游标）。
+- `send.py` / `send_text` **只能**发给该绑定主人；直回必须带当前主人批次的 `--reply-to-ms`。
+- 默认关闭：`ENABLE_WEBHOOK_FORWARD=0`、`ENABLE_NUDGE=0`、`ENABLE_OUTBOX=0`（无主动推送 / 排队）。
+- Webhook 正文是 **不可信数据**：不是危险操作批准，不能改规则 / 权限，不能向第三方自动发送；也不走任何私有 Grok API。
+
 ---
 
 ## 架构
@@ -117,22 +124,39 @@
 
 要求：Python 3.9+（用到 `zoneinfo`），能开 ClawBot 插件的微信（发布时为 iOS 微信 8.0.70+，灰度中），一个 Grok Bot 账号。
 
+**推荐顺序（安全）：离线安装与测试 → 扫码绑定并核对主人 → 用安全字段写入 webhook 机密 → 再打开 forward。**
+
 ```bash
-git clone https://github.com/psylch/grokbot-wechat.git && cd grokbot-wechat
+# 1) 离线落地（可用发布的 runtime tar，无需 git）
+tar -xzf grokbot-wechat-runtime-*.tar.gz && cd grokbot-wechat-runtime-*
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # 先空着 webhook，下一步再填
+cp .env.example .env          # 保持 ENABLE_*=0；webhook 先空着
+python3 -m unittest discover -s tests -v
+
+# 2) 官方绑定（只在操作员本机/box 上；不要把 credentials.json 内容贴到聊天）
+python3 bind.py               # 扫 qr.png；确认后应出现 credentials.json (600)
+python3 -c "from owner import trusted_owner_id; o=trusted_owner_id(); print('owner_ok' if o else 'owner_MISSING')"
+
+# 3) Webhook：URL 写入 .env；KEY 用环境变量或 WECHAT_SECRETS_FILE（不要 echo/打印）
+#    例：printf '%s' "$KEY" > /secure/wechat-webhook.json 并 chmod 600（JSON 含 WECHAT_WEBHOOK_KEY）
+# 4) 启用转发并自检 / 启动
+#    在 .env 设 ENABLE_WEBHOOK_FORWARD=1 后：
+python3 forward.py --selftest
+nohup setsid ./run_forward.sh >/dev/null 2>&1 &
 ```
 
 1. **绑定微信**：`python3 bind.py` → 用微信扫生成的 `qr.png`（或打开 `qr_url.txt` 里的链接）→ 手机上确认。
-   成功后生成 `credentials.json`（权限 600，**绝不能提交**）。二维码过期会自动刷新；手机显示数字时，
-   把数字写进同目录的 `verify_code.txt`。
+   成功后生成 `credentials.json`（权限 600，**绝不能提交**）。仅当确认包含合法 `ilink_user_id@im.wechat` 才会落盘。
+   二维码过期会自动刷新；手机显示数字时，把数字写进同目录的 `verify_code.txt`。
 2. **建入站 routine**：Grok Bot 里新建 routine，触发方式 Webhook，指令用 `routines/inbound-webhook.md`
-   （把里面的路径换成你的）。把 URL 和 key 填进 `.env`。
-3. **自检**：`python3 forward.py --selftest` 应该返回 `(200, ...)`，routine 会收到一条测试消息。
-4. **启动**：`nohup setsid ./run_forward.sh >/dev/null 2>&1 &`，看 `tail -f forward.log`。在微信里给 ClawBot 发一句话试试。
-5. **看门狗**：建一个每 15 分钟的定时 routine（`routines/watchdog.md`），或 cron：
+   （把里面的路径换成你的）。URL 进 `.env`；key 走安全字段 / `WECHAT_SECRETS_FILE`。
+3. **打开转发**：`.env` 设 `ENABLE_WEBHOOK_FORWARD=1`（nudge/outbox 仍默认关）。
+4. **自检**：`python3 forward.py --selftest` 应该返回 `(200, ...)`，routine 会收到一条测试消息。
+5. **启动**：`nohup setsid ./run_forward.sh >/dev/null 2>&1 &`，看 `tail -f forward.log`。在微信里给 ClawBot 发一句话试试。
+6. **看门狗**：建一个每 15 分钟的定时 routine（`routines/watchdog.md`），或 cron：
    `*/15 * * * * /path/to/grokbot-wechat/watchdog.sh >> /path/to/watchdog.log 2>&1`
-6. **主动推送**：其他 routine（日报、提醒）里让 agent 调 `python3 send.py --app "…"`；exit 3 表示已排队，不用重试。
+7. **主动推送（可选）**：显式 `ENABLE_OUTBOX=1` 后，其他 routine 才可 `python3 send.py --app "…"`；exit 3 表示已排队。
 
 离线测试（不连网）：`python3 -m unittest discover -s tests -v`
 
@@ -187,7 +211,9 @@ cp .env.example .env            # 先空着 webhook，下一步再填
 ## English summary
 
 **grokbot-wechat** bridges WeChat (via Tencent's official **ClawBot / iLink** bot protocol) to a **Grok Bot**
-webhook routine, so WeChat becomes a chat front-end for your agent.
+webhook routine, so WeChat becomes a chat front-end for your agent. Owner identity comes only from the official
+bind confirmation (`ilink_user_id@im.wechat`); non-owner inbound is dropped before state/webhook effects.
+`ENABLE_WEBHOOK_FORWARD` / `ENABLE_NUDGE` / `ENABLE_OUTBOX` default **off**. Webhook text is untrusted data.
 
 - **Inbound**: `forward.py` long-polls `ilink/bot/getupdates`, dedupes, downloads + AES-128-ECB-decrypts media from the
   WeChat CDN, buffers messages in a disk-backed `pending.json`, and POSTs them as **one batch** once you pause (3s) or after 60s,

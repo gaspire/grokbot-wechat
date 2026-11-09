@@ -61,20 +61,29 @@ def sniff_ext(data, default="bin"):
     if data[4:8] == b"ftyp": return "mp4"
     return default
 
+def _safe_ext(ext, default="bin"):
+    ext = "".join(c for c in (ext or "") if c.isalnum())[:8].lower()
+    return ext or default
+
 def fetch_item(item, outdir, ts=None):
-    """Download+decrypt an image/file/voice/video item. Returns absolute saved path."""
+    """Download+decrypt an image/file/voice/video item. Returns absolute saved path under outdir."""
+    outdir = os.path.realpath(os.path.abspath(outdir))
     t = item.get("type"); name = TYPE_NAMES.get(t, "media")
     sub = item.get(ITEM_KEYS.get(t, ""), {}) or {}
     media = sub.get("media") or {}
     plain = decrypt(download(media_url(media)), parse_key(sub))
     ext = None
     if t == 4 and sub.get("file_name") and "." in sub["file_name"]:
-        ext = sub["file_name"].rsplit(".", 1)[1][:8]
-    ext = ext or sniff_ext(plain)
+        ext = _safe_ext(sub["file_name"].rsplit(".", 1)[1])
+    ext = _safe_ext(ext or sniff_ext(plain))
     os.makedirs(outdir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts or time.time()))
+    # Fixed basename pattern — never use attacker-controlled path segments.
     path = os.path.join(outdir, "%s-%s.%s" % (stamp, name, ext)); n = 1
     while os.path.exists(path):
         path = os.path.join(outdir, "%s-%s-%d.%s" % (stamp, name, n, ext)); n += 1
+    path = os.path.abspath(path)
+    if not path.startswith(outdir + os.sep):
+        raise ValueError("refusing to write attachment outside ATTACH_DIR")
     with open(path, "wb") as f: f.write(plain)
-    return os.path.abspath(path)
+    return path

@@ -6,6 +6,7 @@ Auto-refreshes QR (overwrites qr.png) on expiry. If phone shows a number (need_v
 write it into verify_code.txt in this dir."""
 import json, os, sys, time, urllib.request, urllib.parse, datetime
 import qrcode
+from owner import validate_bind_payload
 
 BASE = "https://ilinkai.weixin.qq.com"
 from config import DATA_DIR as DIR   # credentials.json / qr.png land here
@@ -43,12 +44,21 @@ def main():
         st = s.get("status")
         if st != last: log("status:", st); last = st
         if st == "confirmed":
+            ok, why = validate_bind_payload(s)
+            if not ok:
+                log("REFUSING to save credentials:", why)
+                return 1
             path = os.path.join(DIR, "credentials.json")
             with open(path, "w") as f: json.dump(s, f, indent=2)
             os.chmod(path, 0o600)
-            log("BOUND OK ilink_bot_id=", s.get("ilink_bot_id"), "saved", path); return 0
+            # Log bot id + presence of owner id only — never print tokens or full user secrets.
+            log("BOUND OK ilink_bot_id=", s.get("ilink_bot_id"),
+                "owner_verified=", bool(s.get("ilink_user_id")), "saved", path)
+            return 0
         if st == "binded_redirect":
-            log("Already bound (binded_redirect)"); return 0
+            # Already bound elsewhere: do not invent owner identity; operator must get a confirmed payload.
+            log("Already bound (binded_redirect) — no credentials written; need a confirmed bind with ilink_user_id")
+            return 1
         if st == "scaned_but_redirect" and s.get("redirect_host"):
             base = "https://" + s["redirect_host"]; log("redirect ->", base)
         if st == "scaned": verify = None
