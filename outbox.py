@@ -1,14 +1,19 @@
 """Outbox for app-initiated WeChat sends + keep-alive nudge.
+
+Both queue/flush and nudge are gated by config flags (default OFF):
+  ENABLE_OUTBOX — queue failed sends and flush after owner inbound
+  ENABLE_NUDGE  — keep-alive renew prompt near the ~24h window end
+
 WeChat iLink only lets the bot message the user for a while (~24h, observed) after the user's
-last message. Failed sends are queued in outbox.json and flushed as soon as the user writes again.
-Near the end of the window, one short nudge asks the user to reply so the window stays open.
-No nudge during quiet hours (default 00:00-07:59 Beijing); if the normal 18-23h nudge slot would
-fall inside quiet hours, the nudge is sent early (as early as 12h) just before quiet hours begin."""
+last message. Failed sends are queued only when ENABLE_OUTBOX=1.
+"""
 import json, os, time, logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import config
 from config import QUIET_TZ, NUDGE_TEXT, quiet_hours
 from ilink import DIR, load_state, save_state, send_text
+from owner import OwnerError, trusted_owner_id
 BJ = ZoneInfo(QUIET_TZ)
 
 OUTBOX = os.path.join(DIR, "outbox.json")   # queued texts; may contain private content, NEVER commit
@@ -36,23 +41,35 @@ def is_ok(resp):
         return False
 
 def enqueue(text, to=None):
+    if not config.ENABLE_OUTBOX:
+        return
     q = _load(); q.append({"text": text, "to": to, "queued_at": time.time()}); _save(q)
 
 def send_or_queue(text, to=None, context_token=None):
-    """Try to send; on failure (or exception) queue it. Returns (sent, resp)."""
+    """Try to send to owner; on failure queue only if ENABLE_OUTBOX. Returns (sent, resp)."""
     try:
         resp, _ = send_text(text, to=to, context_token=context_token)
+    except OwnerError:
+        raise
     except Exception as e:
         resp = "%s: %s" % (type(e).__name__, e)
     if is_ok(resp): return True, resp
-    enqueue(text, to); return False, resp
+    if config.ENABLE_OUTBOX:
+        enqueue(text, to); return False, resp
+    return False, resp
 
 def flush():
-    """Send queued messages in order; stop at first failure. Returns number sent."""
+    """Send queued messages in order; stop at first failure. Returns number sent. No-op if disabled."""
+    if not config.ENABLE_OUTBOX:
+        return 0
+    if not trusted_owner_id():
+        log.warning("outbox flush skipped: no verified owner"); return 0
     q = _load(); sent = 0
     while q:
         item = q[0]
         try: resp, _ = send_text(item["text"], to=item.get("to"), context_token="")
+        except OwnerError as e:
+            log.warning("outbox flush dropped item: %s", e); q.pop(0); _save(q); continue
         except Exception as e: resp = "%s: %s" % (type(e).__name__, e)
         if not is_ok(resp):
             log.warning("outbox flush stopped: %s", str(resp)[:200]); break
@@ -75,6 +92,10 @@ def latest_ok_s(last):
     return t
 
 def maybe_nudge(now=None):
+    if not config.ENABLE_NUDGE:
+        return False
+    if not trusted_owner_id():
+        return False
     now = now or time.time()
     st = load_state(); last = last_inbound_s(st)
     if not last: return False
@@ -84,6 +105,8 @@ def maybe_nudge(now=None):
     if datetime.fromtimestamp(now, BJ).hour in QUIET_HOURS: return False
     if age < NUDGE_AFTER_S and now < latest_ok_s(last) - NUDGE_MARGIN_S: return False
     try: resp, _ = send_text(NUDGE_TEXT, context_token="")
+    except OwnerError as e:
+        log.warning("keepalive nudge refused: %s", e); return False
     except Exception as e: resp = "%s: %s" % (type(e).__name__, e)
     st = load_state(); st["nudged_for"] = last; save_state(st)  # one attempt per window
     log.info("keepalive nudge sent=%s age=%.1fh", is_ok(resp), age / 3600)
